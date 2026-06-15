@@ -48,6 +48,12 @@ namespace MHSqlitePakRepacker
             calligraphyPak = new();
             resourcePak = new();
 
+            if (File.Exists(filePath) == false)
+                return false;
+
+            uint pakHash = Djb2(File.OpenRead(filePath));
+            Console.WriteLine($"SQLite pak hash = 0x{pakHash:X8}");
+
             try
             {
                 using SQLiteConnection connection = new($"Data Source={filePath}");
@@ -71,29 +77,13 @@ namespace MHSqlitePakRepacker
                         return false;
                 }
 
-                bool isCompressed = version.Version >= 1.6f;
-
                 IEnumerable<SqlitePakEntry> entries = connection.Query<SqlitePakEntry>("SELECT i as Id, n as Name, b as Blob, l as Length, s as SavedTime FROM data_tbl");
                 foreach (SqlitePakEntry entry in entries)
                 {
-                    int uncompressedSize;
-                    byte[] blob;
-
-                    if (isCompressed)
-                    {
-                        uncompressedSize = entry.Length;
-                        blob = entry.Blob;
-                    }
-                    else
-                    {
-                        // Older SQLite paks are uncompressed
-                        uncompressedSize = entry.Blob.Length;
-                        int compressedSize = LZ4Codec.Encode(entry.Blob, CompressionBuffer);
-                        blob = CompressionBuffer.AsSpan(0, compressedSize).ToArray();
-                    }
+                    PostProcessEntry(entry, pakHash, version);
 
                     PakFile pakFile = entry.Name.StartsWith("Calligraphy", StringComparison.Ordinal) ? calligraphyPak : resourcePak;
-                    pakFile.AddEntry((ulong)entry.Id, entry.Name, blob, uncompressedSize, entry.SavedTime);
+                    pakFile.AddEntry((ulong)entry.Id, entry.Name, entry.Blob, entry.Length, entry.SavedTime);
                 }
 
                 return true;
@@ -137,6 +127,44 @@ namespace MHSqlitePakRepacker
             }
 
             return true;
+        }
+
+        private static void PostProcessEntry(SqlitePakEntry entry, uint pakHash, SqliteVersion pakVersion)
+        {
+            // Apply fix to Mods/EnemyBoosts/Sets/EndGameNoAnimAffixes.prototype for version 1.10.0.643
+            if (pakHash == 0xB5D5C89E && entry.Id == 3858647238819518931)
+            {
+                // Remove the extra 0x0D byte at index 4 to fix corrupted Calligraphy prototype file header
+                byte[] header = [0x50, 0x54, 0x50, 0x0A];
+                int payloadLength = entry.Blob.Length - 5;
+
+                byte[] fixedBlob = new byte[header.Length + payloadLength];
+                Array.Copy(header, fixedBlob, 4);
+                Array.Copy(entry.Blob, 5, fixedBlob, 4, payloadLength);
+
+                entry.Blob = fixedBlob;
+                entry.Length--;
+
+                Console.WriteLine("Applied fix to Calligraphy/Mods/EnemyBoosts/Sets/EndGameNoAnimAffixes.prototype for version 1.10.0.643");
+            }
+
+            // Older SQLite paks are uncompressed
+            if (pakVersion.Version < 1.6f)
+            {
+                int compressedSize = LZ4Codec.Encode(entry.Blob, CompressionBuffer);
+                entry.Blob = CompressionBuffer.AsSpan(0, compressedSize).ToArray();
+            }
+        }
+
+        private static uint Djb2(Stream stream)
+        {
+            uint hash = 5381;
+
+            int b;
+            while ((b = stream.ReadByte()) != -1)
+                hash = (hash << 5) + hash + (uint)b;
+
+            return hash;
         }
     }
 }
